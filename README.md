@@ -27,3 +27,15 @@ curl -sS -X POST http://127.0.0.1:17321/cmd \
 截图写到 `last.jpg`，元素列表写到 `last.txt`。动作面：`capture` / `click` / `type` / `key` / `scroll` / `drag` / `wait` / `tabs` / `navigate`。
 
 扩展使用 `debugger` 权限，页面顶上会有调试提示条（和 ChatGPT 官方插件一样）。
+
+## Cursor Skill
+
+个人 Skill 已链到 `~/.cursor/skills/chrome-bridge`（源文件在本仓库 `skills/chrome-bridge/`）。
+
+Agent 应通过 CLI 指挥桥：
+
+```bash
+./cb health
+./cb capture lanhuapp.com
+./cb click 15 lanhuapp.com
+```

@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# Thin client for Cursor Chrome Bridge daemon.
+set -euo pipefail
+DAEMON="${CHROME_BRIDGE_URL:-http://127.0.0.1:17321}"
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+TIMEOUT="${CHROME_BRIDGE_TIMEOUT:-60}"
+
+post() {
+  curl -sS -m "$TIMEOUT" -X POST "$DAEMON/cmd" \
+    -H 'Content-Type: application/json' \
+    --data-binary "$1"
+}
+
+json() {
+  python3 -c 'import json,sys; print(json.dumps(json.loads(sys.argv[1])))' "$1"
+}
+
+usage() {
+  cat <<'EOF'
+usage:
+  cb start
+  cb health
+  cb tabs
+  cb capture [urlContains] [mode]     # som|vision|ax
+  cb click <elementId> [urlContains]
+  cb type <elementId> <text> [urlContains]
+  cb key <keys> [urlContains]
+  cb scroll <up|down|left|right> [urlContains]
+  cb wait <seconds>
+  cb raw '<json>'
+EOF
+}
+
+case "${1:-}" in
+  start)
+    if curl -sf -m 1 "$DAEMON/health" >/dev/null 2>&1; then
+      echo "already running"
+      curl -sS -m 3 "$DAEMON/health"; echo
+      exit 0
+    fi
+    nohup python3 "$ROOT/daemon.py" >>"$ROOT/daemon.log" 2>&1 &
+    sleep 0.5
+    curl -sS -m 3 "$DAEMON/health"; echo
+    ;;
+  health)
+    curl -sS -m 3 "$DAEMON/health"
+    echo
+    ;;
+  tabs)
+    post '{"action":"tabs"}'
+    echo
+    ;;
+  capture)
+    url="${2:-}"; mode="${3:-som}"
+    if [[ -n "$url" ]]; then
+      body=$(MODE="$mode" URL="$url" python3 - <<'PY'
+import json, os
+print(json.dumps({"action": "capture", "mode": os.environ["MODE"], "urlContains": os.environ["URL"]}))
+PY
+)
+    else
+      body=$(MODE="$mode" python3 - <<'PY'
+import json, os
+print(json.dumps({"action": "capture", "mode": os.environ["MODE"]}))
+PY
+)
+    fi
+    post "$body"
+    echo
+    echo "shot: $ROOT/last.jpg"
+    echo "index: $ROOT/last.txt"
+    ;;
+  click)
+    [[ $# -ge 2 ]] || { usage; exit 2; }
+    el="$2"; url="${3:-}"
+    body=$(EL="$el" URL="$url" python3 - <<'PY'
+import json, os
+d = {"action": "click", "element": int(os.environ["EL"]), "capture_after": True}
+if os.environ.get("URL"):
+    d["urlContains"] = os.environ["URL"]
+print(json.dumps(d))
+PY
+)
+    post "$body"
+    echo
+    echo "shot: $ROOT/last.jpg"
+    echo "index: $ROOT/last.txt"
+    ;;
+  type)
+    [[ $# -ge 3 ]] || { usage; exit 2; }
+    el="$2"; text="$3"; url="${4:-}"
+    body=$(EL="$el" TEXT="$text" URL="$url" python3 - <<'PY'
+import json, os
+d = {"action": "type", "element": int(os.environ["EL"]), "text": os.environ["TEXT"], "capture_after": True}
+if os.environ.get("URL"):
+    d["urlContains"] = os.environ["URL"]
+print(json.dumps(d))
+PY
+)
+    post "$body"
+    echo
+    ;;
+  key)
+    [[ $# -ge 2 ]] || { usage; exit 2; }
+    keys="$2"; url="${3:-}"
+    body=$(KEYS="$keys" URL="$url" python3 - <<'PY'
+import json, os
+d = {"action": "key", "keys": os.environ["KEYS"]}
+if os.environ.get("URL"):
+    d["urlContains"] = os.environ["URL"]
+print(json.dumps(d))
+PY
+)
+    post "$body"
+    echo
+    ;;
+  scroll)
+    [[ $# -ge 2 ]] || { usage; exit 2; }
+    dir="$2"; url="${3:-}"
+    body=$(DIR="$dir" URL="$url" python3 - <<'PY'
+import json, os
+d = {"action": "scroll", "direction": os.environ["DIR"], "amount": 3, "capture_after": True}
+if os.environ.get("URL"):
+    d["urlContains"] = os.environ["URL"]
+print(json.dumps(d))
+PY
+)
+    post "$body"
+    echo
+    ;;
+  wait)
+    sec="${2:-0.5}"
+    body=$(SEC="$sec" python3 - <<'PY'
+import json, os
+print(json.dumps({"action": "wait", "seconds": float(os.environ["SEC"])}))
+PY
+)
+    post "$body"
+    echo
+    ;;
+  raw)
+    [[ $# -ge 2 ]] || { usage; exit 2; }
+    post "$(json "$2")"
+    echo
+    ;;
+  ""|-h|--help|help)
+    usage
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

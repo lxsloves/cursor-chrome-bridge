@@ -437,7 +437,19 @@ async function handle(cmd) {
     return { ok: true, tabId };
   }
   if (action === "evaluate") {
-    return runInTab(tabId, (code) => eval(code), [cmd.js]);
+    // return a plain object so MV3 scripting always serializes a result
+    return runInTab(
+      tabId,
+      (code) => {
+        try {
+          const v = (0, eval)(code);
+          return { ok: true, value: v == null ? null : v };
+        } catch (e) {
+          return { ok: false, error: String(e && e.message ? e.message : e) };
+        }
+      },
+      [cmd.js]
+    );
   }
   if (action === "capture") {
     return doCapture(tabId, cmd.mode || "som");
