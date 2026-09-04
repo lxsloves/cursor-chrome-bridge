@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Cursor Chrome Bridge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "让本机 Cursor 按 Codex 方式操作已打开的 Chrome 标签（只连 127.0.0.1）",
   "permissions": ["tabs", "scripting", "activeTab", "debugger"],
   "host_permissions": ["<all_urls>", "http://127.0.0.1:17321/*"],

@@ -1,4 +1,5 @@
 const DAEMON = "http://127.0.0.1:17321";
+const BRIDGE_HEADERS = { "X-Cursor-Chrome-Bridge": "1" };
 const cache = new Map(); // tabId -> { elements, viewport }
 const dbgOn = new Set();
 
@@ -7,12 +8,21 @@ function sleep(ms) {
 }
 
 async function resolveTab(cmd) {
-  if (cmd.tabId) return cmd.tabId;
+  if (cmd.tabId != null) {
+    const tabId = Number(cmd.tabId);
+    if (!Number.isInteger(tabId)) throw new Error("tabId must be an integer");
+    await chrome.tabs.get(tabId);
+    return tabId;
+  }
   if (cmd.urlContains) {
     const tabs = await chrome.tabs.query({});
-    const hit = tabs.find((t) => (t.url || "").includes(cmd.urlContains));
-    if (!hit) throw new Error(`no tab matching ${cmd.urlContains}`);
-    return hit.id;
+    const hits = tabs.filter((t) => (t.url || "").includes(cmd.urlContains));
+    if (!hits.length) throw new Error(`no tab matching ${cmd.urlContains}`);
+    if (hits.length > 1) {
+      const choices = hits.slice(0, 5).map((t) => `${t.id}: ${t.title || ""} (${t.url || ""})`).join("; ");
+      throw new Error(`multiple tabs match ${cmd.urlContains}; use tabId. ${choices}`);
+    }
+    return hits[0].id;
   }
   const [t] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   if (!t) throw new Error("no active tab");
@@ -198,6 +208,39 @@ function injectTypeAt(x, y, text) {
     el.dispatchEvent(new InputEvent("input", { bubbles: true, data: text }));
   }
   return { ok: true };
+}
+
+function injectRead(selector, maxChars) {
+  const root = selector ? document.querySelector(selector) : document.body;
+  if (!root) throw new Error(`no element matching ${selector}`);
+  const text = (root.innerText || root.textContent || "").replace(/\u00a0/g, " ");
+  const limit = Math.max(1, Math.min(Number(maxChars) || 30000, 100000));
+  return {
+    title: document.title,
+    url: location.href,
+    selector: selector || "body",
+    text: text.slice(0, limit),
+    length: text.length,
+    truncated: text.length > limit,
+  };
+}
+
+async function injectWaitFor(selector, text, timeoutMs) {
+  const timeout = Math.max(0, Math.min(Number(timeoutMs) || 10000, 30000));
+  const expected = text == null ? "" : String(text);
+  const matches = () => {
+    const root = selector ? document.querySelector(selector) : document.body;
+    if (!root) return false;
+    return expected ? (root.innerText || root.textContent || "").includes(expected) : true;
+  };
+  const started = Date.now();
+  while (!matches()) {
+    if (Date.now() - started >= timeout) {
+      throw new Error(`wait_for timed out: ${selector || "body"}${expected ? ` contains ${expected}` : ""}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return { ok: true, selector: selector || "body", text: expected || null, waitedMs: Date.now() - started };
 }
 
 async function runInTab(tabId, func, args = []) {
@@ -404,10 +447,19 @@ async function handle(cmd) {
   }
   if (action === "click_xy") action = "click";
   if (action === "list_apps") action = "tabs";
+  if (action === "read_text") action = "read";
+  if (action === "new_tab") action = "open";
+  if (action === "close_tab") action = "close";
+
+  if (action === "open") {
+    if (!/^https?:\/\//i.test(String(cmd.url || ""))) throw new Error("open needs an http(s) URL");
+    const tab = await chrome.tabs.create({ url: cmd.url, active: cmd.active !== false });
+    return { ok: true, tabId: tab.id, windowId: tab.windowId, url: tab.url, title: tab.title || "" };
+  }
 
   if (action === "tabs") {
     const tabs = await chrome.tabs.query({});
-    return tabs.map((t) => ({ id: t.id, title: t.title, url: t.url, active: t.active }));
+    return tabs.map((t) => ({ id: t.id, windowId: t.windowId, title: t.title, url: t.url, active: t.active }));
   }
 
   const tabId = await resolveTab(cmd);
@@ -417,6 +469,7 @@ async function handle(cmd) {
     return { ok: true };
   }
   if (action === "navigate") {
+    if (!/^https?:\/\//i.test(String(cmd.url || ""))) throw new Error("navigate needs an http(s) URL");
     await chrome.tabs.update(tabId, { url: cmd.url });
     return { ok: true, tabId };
   }
@@ -433,10 +486,22 @@ async function handle(cmd) {
     return { ok: true };
   }
   if (action === "focus_app") {
+    const tab = await chrome.tabs.get(tabId);
     await chrome.tabs.update(tabId, { active: true });
+    await chrome.windows.update(tab.windowId, { focused: true });
     return { ok: true, tabId };
   }
+  if (action === "close") {
+    const tab = await chrome.tabs.get(tabId);
+    await chrome.tabs.remove(tabId);
+    cache.delete(tabId);
+    dbgOn.delete(tabId);
+    return { ok: true, tabId, url: tab.url, title: tab.title || "" };
+  }
   if (action === "evaluate") {
+    if (cmd.allowUnsafe !== true) {
+      throw new Error("evaluate is disabled by default; pass allowUnsafe=true only with explicit user approval");
+    }
     // return a plain object so MV3 scripting always serializes a result
     return runInTab(
       tabId,
@@ -450,6 +515,12 @@ async function handle(cmd) {
       },
       [cmd.js]
     );
+  }
+  if (action === "read") {
+    return runInTab(tabId, injectRead, [cmd.selector || "", cmd.maxChars]);
+  }
+  if (action === "wait_for") {
+    return runInTab(tabId, injectWaitFor, [cmd.selector || "", cmd.text, cmd.timeoutMs || cmd.timeout]);
   }
   if (action === "capture") {
     return doCapture(tabId, cmd.mode || "som");
@@ -470,7 +541,7 @@ async function handle(cmd) {
   }
 
   if (action === "type") {
-    const text = cmd.text || "";
+    const text = String(cmd.text ?? "");
     const aimed = cmd.element != null || cmd.ref != null || cmd.coordinate || (cmd.x != null && cmd.y != null);
     if (aimed) {
       const pt = xyOf(cmd, tabId);
@@ -481,6 +552,24 @@ async function handle(cmd) {
       return { ok: true, via: "cdp", n: text.length };
     }
     if (!aimed) throw new Error("type without debugger needs element or x/y");
+    const pt = xyOf(cmd, tabId);
+    return runInTab(tabId, injectTypeAt, [pt[0], pt[1], text]);
+  }
+
+  if (action === "fill") {
+    const text = String(cmd.text ?? "");
+    const aimed = cmd.element != null || cmd.ref != null || cmd.coordinate || (cmd.x != null && cmd.y != null);
+    if (aimed) {
+      const pt = xyOf(cmd, tabId);
+      await mouse(tabId, pt[0], pt[1], { button: "left", count: 1 });
+    }
+    if (await attachDbg(tabId)) {
+      const platform = await chrome.runtime.getPlatformInfo();
+      await pressKeys(tabId, `${platform.os === "mac" ? "cmd" : "ctrl"}+a`);
+      await cdp(tabId, "Input.insertText", { text });
+      return { ok: true, via: "cdp", n: text.length };
+    }
+    if (!aimed) throw new Error("fill without debugger needs element or x/y");
     const pt = xyOf(cmd, tabId);
     return runInTab(tabId, injectTypeAt, [pt[0], pt[1], text]);
   }
@@ -501,7 +590,7 @@ async function handle(cmd) {
       y = vp.h / 2;
     }
     const delta = amount * 120;
-    const deltaX = dir === "left" ? delta : dir === "right" ? -delta : 0;
+    const deltaX = dir === "left" ? -delta : dir === "right" ? delta : 0;
     const deltaY = dir === "up" ? -delta : dir === "down" ? delta : 0;
     if (await attachDbg(tabId)) {
       await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseWheel", x, y, deltaX, deltaY });
@@ -550,7 +639,7 @@ async function runCmd(cmd) {
 async function report(id, payload) {
   await fetch(`${DAEMON}/result`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...BRIDGE_HEADERS },
     body: JSON.stringify({ id, ...payload }),
   });
 }
@@ -558,7 +647,7 @@ async function report(id, payload) {
 async function pump() {
   for (;;) {
     try {
-      const r = await fetch(`${DAEMON}/pull`);
+      const r = await fetch(`${DAEMON}/pull`, { headers: BRIDGE_HEADERS });
       const cmd = await r.json();
       chrome.action.setBadgeText({ text: "ON" });
       chrome.action.setBadgeBackgroundColor({ color: "#0a0" });

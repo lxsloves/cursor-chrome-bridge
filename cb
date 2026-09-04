@@ -6,9 +6,11 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 TIMEOUT="${CHROME_BRIDGE_TIMEOUT:-60}"
 
 post() {
-  curl -sS -m "$TIMEOUT" -X POST "$DAEMON/cmd" \
+  response=$(curl -sS -m "$TIMEOUT" -X POST "$DAEMON/cmd" \
     -H 'Content-Type: application/json' \
-    --data-binary "$1"
+    --data-binary "$1")
+  printf '%s\n' "$response"
+  printf '%s' "$response" | python3 -c 'import json,sys; data=json.load(sys.stdin); raise SystemExit(0 if data.get("ok") else 1)'
 }
 
 json() {
@@ -21,12 +23,18 @@ usage:
   cb start
   cb health
   cb tabs
+  cb open <url>
+  cb focus <tabId>
+  cb close <tabId>
   cb capture [urlContains] [mode]     # som|vision|ax
+  cb read [urlContains] [selector] [maxChars]
   cb click <elementId> [urlContains]
   cb type <elementId> <text> [urlContains]
+  cb fill <elementId> <text> [urlContains]
   cb key <keys> [urlContains]
   cb scroll <up|down|left|right> [urlContains]
   cb wait <seconds>
+  cb wait-for <text> [urlContains] [selector] [timeoutMs]
   cb raw '<json>'
 EOF
 }
@@ -43,12 +51,39 @@ case "${1:-}" in
     curl -sS -m 3 "$DAEMON/health"; echo
     ;;
   health)
-    curl -sS -m 3 "$DAEMON/health"
-    echo
+    response=$(curl -sS -m 3 "$DAEMON/health")
+    printf '%s\n' "$response"
+    printf '%s' "$response" | python3 -c 'import json,sys; data=json.load(sys.stdin); raise SystemExit(0 if data.get("ok") and data.get("extension") else 1)'
     ;;
   tabs)
     post '{"action":"tabs"}'
-    echo
+    ;;
+  open)
+    [[ $# -ge 2 ]] || { usage; exit 2; }
+    body=$(URL="$2" python3 - <<'PY'
+import json, os
+print(json.dumps({"action": "open", "url": os.environ["URL"]}))
+PY
+)
+    post "$body"
+    ;;
+  focus)
+    [[ $# -ge 2 ]] || { usage; exit 2; }
+    body=$(TAB_ID="$2" python3 - <<'PY'
+import json, os
+print(json.dumps({"action": "focus_app", "tabId": int(os.environ["TAB_ID"])}))
+PY
+)
+    post "$body"
+    ;;
+  close)
+    [[ $# -ge 2 ]] || { usage; exit 2; }
+    body=$(TAB_ID="$2" python3 - <<'PY'
+import json, os
+print(json.dumps({"action": "close", "tabId": int(os.environ["TAB_ID"])}))
+PY
+)
+    post "$body"
     ;;
   capture)
     url="${2:-}"; mode="${3:-som}"
@@ -69,6 +104,21 @@ PY
     echo
     echo "shot: $ROOT/last.jpg"
     echo "index: $ROOT/last.txt"
+    ;;
+  read)
+    url="${2:-}"; selector="${3:-}"; max_chars="${4:-30000}"
+    body=$(URL="$url" SELECTOR="$selector" MAX_CHARS="$max_chars" python3 - <<'PY'
+import json, os
+d = {"action": "read", "maxChars": int(os.environ["MAX_CHARS"])}
+if os.environ.get("URL"):
+    d["urlContains"] = os.environ["URL"]
+if os.environ.get("SELECTOR"):
+    d["selector"] = os.environ["SELECTOR"]
+print(json.dumps(d))
+PY
+)
+    post "$body"
+    echo
     ;;
   click)
     [[ $# -ge 2 ]] || { usage; exit 2; }
@@ -98,7 +148,19 @@ print(json.dumps(d))
 PY
 )
     post "$body"
-    echo
+    ;;
+  fill)
+    [[ $# -ge 3 ]] || { usage; exit 2; }
+    el="$2"; text="$3"; url="${4:-}"
+    body=$(EL="$el" TEXT="$text" URL="$url" python3 - <<'PY'
+import json, os
+d = {"action": "fill", "element": int(os.environ["EL"]), "text": os.environ["TEXT"], "capture_after": True}
+if os.environ.get("URL"):
+    d["urlContains"] = os.environ["URL"]
+print(json.dumps(d))
+PY
+)
+    post "$body"
     ;;
   key)
     [[ $# -ge 2 ]] || { usage; exit 2; }
@@ -133,6 +195,22 @@ PY
     body=$(SEC="$sec" python3 - <<'PY'
 import json, os
 print(json.dumps({"action": "wait", "seconds": float(os.environ["SEC"])}))
+PY
+)
+    post "$body"
+    echo
+    ;;
+  wait-for)
+    [[ $# -ge 2 ]] || { usage; exit 2; }
+    text_value="$2"; url="${3:-}"; selector="${4:-}"; timeout_ms="${5:-10000}"
+    body=$(TEXT="$text_value" URL="$url" SELECTOR="$selector" TIMEOUT_MS="$timeout_ms" python3 - <<'PY'
+import json, os
+d = {"action": "wait_for", "text": os.environ["TEXT"], "timeoutMs": int(os.environ["TIMEOUT_MS"])}
+if os.environ.get("URL"):
+    d["urlContains"] = os.environ["URL"]
+if os.environ.get("SELECTOR"):
+    d["selector"] = os.environ["SELECTOR"]
+print(json.dumps(d))
 PY
 )
     post "$body"
